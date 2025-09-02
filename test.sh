@@ -5,100 +5,92 @@
 # 仓库: https://github.com/gmddd002/free-vps-py
 # 项目: https://github.com/gmddd002/python-xray-argo
 # =========================================
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'  # 无颜色
 
-NODE_INFO_FILE="$HOME/.my_nodes_info"
-PROJECT_DIR_NAME="python-xray-argo"
+LOGFILE="app.log"
 
-echo "======================================="
-echo "   私有自控版 Xray Argo 一键部署脚本"
-echo "   所有数据与代码均来自 gmddd002 仓库"
-echo "======================================="
+echo -e "${GREEN}>>> 安装必要依赖...${NC}" | tee -a "$LOGFILE"
+# 更新软件源并安装 Python3、pip、screen、jq 等
+apt-get update
+apt-get install -y python3 python3-pip screen jq curl git
 
-# Step 1: 检查环境
-echo "[*] 检查环境..."
-if ! command -v python3 &> /dev/null; then
-    echo "未找到 Python3，正在安装..."
-    sudo apt-get update && sudo apt-get install -y python3 python3-pip
-fi
+echo -e "${GREEN}>>> 安装 cloudflared（Argo 隧道客户端）...${NC}" | tee -a "$LOGFILE"
+# 安装 cloudflared：可通过 apt 或下载官方包
+curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+dpkg -i cloudflared.deb 2>/dev/null || apt-get install -f -y
+rm -f cloudflared.deb
 
-if ! python3 -c "import requests" &> /dev/null; then
-    echo "安装 Python 依赖 requests..."
-    pip3 install requests
-fi
+echo -e "${GREEN}>>> 克隆用户仓库并安装依赖...${NC}" | tee -a "$LOGFILE"
+# 从用户 GitHub 仓库拉取脚本
+cd /root
+rm -rf python-xray-argo
+git clone https://github.com/gmddd002/python-xray-argo.git
+cd python-xray-argo
+# 安装 Python 依赖
+pip3 install -r requirements.txt
 
-# Step 2: 下载项目代码（仅从你自己的仓库获取）
-if [ ! -d "$PROJECT_DIR_NAME" ]; then
-    echo "[*] 克隆你的项目仓库..."
-    git clone https://github.com/gmddd002/python-xray-argo.git "$PROJECT_DIR_NAME"
-fi
-
-cd "$PROJECT_DIR_NAME" || exit 1
-
-# Step 3: 用户输入参数
-read -p "请输入 UUID (留空自动生成): " UUID_INPUT
-if [ -z "$UUID_INPUT" ]; then
-    UUID_INPUT=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
-    echo "自动生成 UUID: $UUID_INPUT"
-fi
-
-read -p "请输入节点名称 (自定义标识): " NAME_INPUT
-
-# Step 4: Hugging Face 保活设置
-echo "配置 Hugging Face 保活..."
-read -p "请输入 Hugging Face Token: " HF_TOKEN
-read -p "请输入 Hugging Face Repo ID (例如: gmddd002/myspace): " HF_REPO_ID
-
-# Step 5: 修改 app.py 配置
-if [ ! -f "app.py" ]; then
-    echo "未找到 app.py，请确认仓库内容正确。"
-    exit 1
-fi
-
-sed -i "s/UUID = os.environ.get('UUID'.*/UUID = os.environ.get('UUID', '$UUID_INPUT')/" app.py
-sed -i "s/NAME = os.environ.get('NAME'.*/NAME = os.environ.get('NAME', '$NAME_INPUT')/" app.py
-
-# Step 6: 启动服务
-echo "[*] 启动服务..."
-nohup python3 app.py > app.log 2>&1 &
-APP_PID=$!
-
-# Step 7: 保活任务（完全闭环，只写本地日志）
-cat > keep_alive_task.sh <<EOF
-#!/bin/bash
+# 自动分配未占用端口（优选 20000–29999 范围）
+echo -e "${GREEN}>>> 分配未占用的服务端口...${NC}" | tee -a "$LOGFILE"
 while true; do
-    status_code=\$(curl -s -o /dev/null -w "%{http_code}" --header "Authorization: Bearer $HF_TOKEN" "https://huggingface.co/api/spaces/$HF_REPO_ID")
-    if [ "\$status_code" -eq 200 ]; then
-        echo "\$(date): Hugging Face Space 保活成功 (状态码: 200)" > keep_alive_status.log
-    else
-        echo "\$(date): Hugging Face Space 保活失败 (状态码: \$status_code)" > keep_alive_status.log
-    fi
-    sleep 120
+  PORT=$(python3 - <<'PYCODE'
+import socket, random
+while True:
+    port = random.randint(20000, 29999)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(('localhost', port)) != 0:
+            print(port)
+            break
+PYCODE
+)
+  # 验证端口号是否获取成功
+  if [[ -n "$PORT" ]]; then
+    break
+  fi
 done
-EOF
-chmod +x keep_alive_task.sh
-nohup ./keep_alive_task.sh >/dev/null 2>&1 &
-KEEPALIVE_PID=$!
+export PORT
+echo -e "${BLUE}Allocated PORT:$NC $PORT" | tee -a "$LOGFILE"
 
-# Step 8: 保存节点信息（本地文件，仅自己可见）
-cat > "$NODE_INFO_FILE" <<EOF
-=======================================
-           节点信息保存
-=======================================
-部署时间: $(date)
-UUID: $UUID_INPUT
-节点名称: $NAME_INPUT
-服务PID: $APP_PID
-保活PID: $KEEPALIVE_PID
-HuggingFace Repo: $HF_REPO_ID
+# 启动 Xray-Argo 服务并记录日志
+echo -e "${GREEN}>>> 启动 Xray-Argo 应用 (app.py)...${NC}" | tee -a "$LOGFILE"
+# 使用 nohup 后台运行 app.py，并将输出同时记录到控制台和日志
+nohup python3 app.py 2>&1 | tee -a "$LOGFILE" &
 
-=== 管理命令 ===
-查看日志: tail -f app.log
-停止服务: kill $APP_PID
-停止保活: kill $KEEPALIVE_PID
-=======================================
-EOF
+# 等待服务启动完成并生成所需文件
+sleep 15
 
-echo "======================================="
-echo " 部署完成！信息已保存到 $NODE_INFO_FILE"
-echo " 查看日志: tail -f app.log"
-echo "======================================="
+# 从 boot.log 中提取 trycloudflare 域名（Argo Tunnel 分配的临时地址）
+ARGO_ADDR=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' boot.log | head -n1)
+ARGO_ADDR=${ARGO_ADDR#https://}
+echo -e "${GREEN}临时隧道地址:${NC} $ARGO_ADDR" | tee -a "$LOGFILE"
+
+# 读取并解码订阅（Base64 内容），获得各协议链接
+SUB_B64=$(cat sub.txt)
+echo -e "${GREEN}Base64 订阅链接:${NC} $SUB_B64" | tee -a "$LOGFILE"
+DECODED_LINKS=$(echo "$SUB_B64" | base64 -d)
+echo -e "${GREEN}节点连接信息 (VLESS/VMESS/Trojan):${NC}" | tee -a "$LOGFILE"
+# 分别提取三种协议的完整 URI
+VLESS_URI=$(echo "$DECODED_LINKS" | grep -oE 'vless://[^ ]+')
+VMESS_URI=$(echo "$DECODED_LINKS" | grep -oE 'vmess://[^ ]+')
+TROJAN_URI=$(echo "$DECODED_LINKS" | grep -oE 'trojan://[^ ]+')
+echo "  VLESS: $VLESS_URI" | tee -a "$LOGFILE"
+echo "  VMESS: $VMESS_URI" | tee -a "$LOGFILE"
+echo "  Trojan: $TROJAN_URI" | tee -a "$LOGFILE"
+
+# 解析并打印关键连接参数：UUID、端口、SNI、Host、传输类型等
+UUID=$(echo "$VLESS_URI" | grep -oP '(?<=://)[^@]+')
+PORT_NUM=$(echo "$VLESS_URI" | awk -F'[@:]' '{print $3}' | cut -d'?' -f1)
+SNI=$(echo "$VLESS_URI" | grep -oP '(?<=&sni=)[^&]+')
+HOST=$(echo "$VLESS_URI" | grep -oP '(?<=&host=)[^&]+')
+NET_TYPE=$(echo "$VLESS_URI" | grep -oP '(?<=&type=)[^&]+')
+echo -e "${GREEN}连接参数:${NC}" | tee -a "$LOGFILE"
+echo "  UUID: $UUID" | tee -a "$LOGFILE"
+echo "  端口: $PORT_NUM" | tee -a "$LOGFILE"
+echo "  SNI: $SNI" | tee -a "$LOGFILE"
+echo "  Host: $HOST" | tee -a "$LOGFILE"
+echo "  传输类型: $NET_TYPE" | tee -a "$LOGFILE"
+
+echo -e "${GREEN}>>> 部署完成，服务已启动并运行。${NC}" | tee -a "$LOGFILE"
