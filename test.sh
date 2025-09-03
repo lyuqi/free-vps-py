@@ -1,121 +1,104 @@
 #!/bin/bash
-set -e
+# =========================================
+# 自控版一键部署脚本
+# Author: gmddd002
+# 仓库: https://github.com/gmddd002/free-vps-py
+# 项目: https://github.com/gmddd002/python-xray-argo
+# =========================================
 
-# 缓存目录
-CACHE_DIR="./.cache"
-mkdir -p "$CACHE_DIR"
-echo "$CACHE_DIR is created"
+NODE_INFO_FILE="$HOME/.my_nodes_info"
+PROJECT_DIR_NAME="python-xray-argo"
 
-# Argo 参数检查
-if [[ -z "$ARGO_DOMAIN" || -z "$ARGO_AUTH" ]]; then
-    echo "ARGO_DOMAIN or ARGO_AUTH variable is empty, use quick tunnels"
+echo "======================================="
+echo "   私有自控版 Xray Argo 一键部署脚本"
+echo "   所有数据与代码均来自 gmddd002 仓库"
+echo "======================================="
+
+# Step 1: 检查环境
+echo "[*] 检查环境..."
+if ! command -v python3 &> /dev/null; then
+    echo "未找到 Python3，正在安装..."
+    sudo apt-get update && sudo apt-get install -y python3 python3-pip
 fi
 
-# 下载并授权组件
-echo "Download web successfully"
-echo "Download bot successfully"
-chmod 775 "$CACHE_DIR/web"
-chmod 775 "$CACHE_DIR/bot"
-echo "Empowerment success for $CACHE_DIR/web: 775"
-echo "Empowerment success for $CACHE_DIR/bot: 775"
-
-# 可选：哪吒探针
-if [[ -z "$NEZHA" ]]; then
-    echo "NEZHA variable is empty, skipping running"
+if ! python3 -c "import requests" &> /dev/null; then
+    echo "安装 Python 依赖 requests..."
+    pip3 install requests
 fi
 
-# 启动 web 和 bot
-"$CACHE_DIR/web" >/dev/null 2>&1 &
-echo "web is running"
-"$CACHE_DIR/bot" >/dev/null 2>&1 &
-echo "bot is running"
+# Step 2: 下载项目代码（仅从你自己的仓库获取）
+if [ ! -d "$PROJECT_DIR_NAME" ]; then
+    echo "[*] 克隆你的项目仓库..."
+    git clone https://github.com/gmddd002/python-xray-argo.git "$PROJECT_DIR_NAME"
+fi
 
-# 启动主服务 app.py
-PORT=3000
-python3 app.py >/dev/null 2>&1 &
-MAIN_PID=$!
-sleep 2
-KEEP_PID=$$
+cd "$PROJECT_DIR_NAME" || exit 1
 
-# 模拟生成 Argo 域名（真实运行时替换成 cloudflared 输出）
-ARGO_DOMAIN="brass-cp-tvs-tale.trycloudflare.com"
-echo "ArgoDomain: $ARGO_DOMAIN"
+# Step 3: 用户输入参数
+read -p "请输入 UUID (留空自动生成): " UUID_INPUT
+if [ -z "$UUID_INPUT" ]; then
+    UUID_INPUT=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
+    echo "自动生成 UUID: $UUID_INPUT"
+fi
 
-# 节点配置参数
-UUID=$(cat /proc/sys/kernel/random/uuid)
-SNI="$ARGO_DOMAIN"
-HOST="$ARGO_DOMAIN"
+read -p "请输入节点名称 (自定义标识): " NAME_INPUT
 
-VLESS_LINK="vless://$UUID@www.visa.com.tw:443?encryption=none&security=tls&sni=$SNI&fp=chrome&type=ws&host=$HOST&path=%2Fvless-argo%3Fed%3D2560#Vls-US-Amazon_Technologies_Inc."
-VMESS_JSON="{\"v\": \"2\", \"ps\": \"Vls-US-Amazon_Technologies_Inc.\", \"add\": \"www.visa.com.tw\", \"port\": \"443\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$HOST\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"$SNI\", \"fp\": \"chrome\"}"
-VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w0)"
-TROJAN_LINK="trojan://$UUID@www.visa.com.tw:443?security=tls&sni=$SNI&fp=chrome&type=ws&host=$HOST&path=%2Ftrojan-argo%3Fed%3D2560#Vls-US-Amazon_Technologies_Inc."
+# Step 4: Hugging Face 保活设置
+echo "配置 Hugging Face 保活..."
+read -p "请输入 Hugging Face Token: " HF_TOKEN
+read -p "请输入 Hugging Face Repo ID (例如: gmddd002/myspace): " HF_REPO_ID
 
-# 保存订阅文件
-cat > "$CACHE_DIR/sub.txt" <<EOF
-$VLESS_LINK
+# Step 5: 修改 app.py 配置
+if [ ! -f "app.py" ]; then
+    echo "未找到 app.py，请确认仓库内容正确。"
+    exit 1
+fi
 
-$VMESS_LINK
+sed -i "s/UUID = os.environ.get('UUID'.*/UUID = os.environ.get('UUID', '$UUID_INPUT')/" app.py
+sed -i "s/NAME = os.environ.get('NAME'.*/NAME = os.environ.get('NAME', '$NAME_INPUT')/" app.py
 
-$TROJAN_LINK
-EOF
-echo "$CACHE_DIR/sub.txt saved successfully"
+# Step 6: 启动服务
+echo "[*] 启动服务..."
+nohup python3 app.py > app.log 2>&1 &
+APP_PID=$!
 
-# Base64 订阅
-BASE64_SUB=$(base64 -w0 "$CACHE_DIR/sub.txt")
-
-# 保活循环
-(
-  while true; do
-    if ! ps -p $MAIN_PID >/dev/null 2>&1; then
-      echo "[KEEPALIVE] app.py crashed, restarting..." >> keepalive.log
-      python3 app.py >/dev/null 2>&1 &
-      MAIN_PID=$!
-      echo "[KEEPALIVE] app.py restarted with PID $MAIN_PID" >> keepalive.log
+# Step 7: 保活任务（完全闭环，只写本地日志）
+cat > keep_alive_task.sh <<EOF
+#!/bin/bash
+while true; do
+    status_code=\$(curl -s -o /dev/null -w "%{http_code}" --header "Authorization: Bearer $HF_TOKEN" "https://huggingface.co/api/spaces/$HF_REPO_ID")
+    if [ "\$status_code" -eq 200 ]; then
+        echo "\$(date): Hugging Face Space 保活成功 (状态码: 200)" > keep_alive_status.log
+    else
+        echo "\$(date): Hugging Face Space 保活失败 (状态码: \$status_code)" > keep_alive_status.log
     fi
-    sleep 10
-  done
-) &
+    sleep 120
+done
+EOF
+chmod +x keep_alive_task.sh
+nohup ./keep_alive_task.sh >/dev/null 2>&1 &
+KEEPALIVE_PID=$!
 
-# 界面输出
-echo "========================================"
-echo "                  部署完成！             "
-echo "========================================"
-echo
-echo "=== 服务信息 ==="
-echo "服务状态: 运行中"
-echo "主服务PID: $MAIN_PID"
-echo "保活服务PID: $KEEP_PID"
-echo "服务端口: $PORT"
-echo "UUID: $UUID"
-echo "订阅路径: /sub"
-echo
-echo "=== 访问地址 ==="
-IP=$(hostname -I | awk '{print $1}')
-echo "订阅地址: http://$IP:$PORT/sub"
-echo "管理面板: http://$IP:$PORT"
-echo "本地订阅: http://localhost:$PORT/sub"
-echo "本地面板: http://localhost:$PORT"
-echo
-echo "=== 节点信息 ==="
-echo "节点配置:"
-echo
-echo "$VLESS_LINK"
-echo
-echo "$VMESS_LINK"
-echo
-echo "$TROJAN_LINK"
-echo
-echo "订阅链接:"
-echo "$BASE64_SUB"
-echo
-echo "节点信息已保存到 $CACHE_DIR/sub.txt"
-echo "使用脚本选择选项3或运行带-v参数可随时查看节点信息"
-echo
-echo "=== 重要提示 ==="
-echo "部署已完成，节点信息已成功生成"
-echo "可以立即使用订阅地址添加到客户端"
-echo "YouTube / Netflix 等流媒体分流已集成到 xray 配置，无需额外设置"
-echo "服务将持续在后台运行"
-echo
-echo "部署完成！感谢使用！"
+# Step 8: 保存节点信息（本地文件，仅自己可见）
+cat > "$NODE_INFO_FILE" <<EOF
+=======================================
+           节点信息保存
+=======================================
+部署时间: $(date)
+UUID: $UUID_INPUT
+节点名称: $NAME_INPUT
+服务PID: $APP_PID
+保活PID: $KEEPALIVE_PID
+HuggingFace Repo: $HF_REPO_ID
+
+=== 管理命令 ===
+查看日志: tail -f app.log
+停止服务: kill $APP_PID
+停止保活: kill $KEEPALIVE_PID
+=======================================
+EOF
+
+echo "======================================="
+echo " 部署完成！信息已保存到 $NODE_INFO_FILE"
+echo " 查看日志: tail -f app.log"
+echo "======================================="
