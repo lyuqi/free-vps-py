@@ -1,131 +1,164 @@
 #!/bin/bash
 # =========================================
-# 自控版一键部署脚本 (无 root 兼容 + 完整输出版)
+# 保守版一键部署脚本 + Flask 前端展示
 # Author: gmddd002
-# Repo: https://github.com/gmddd002/free-vps-py
-# Project: https://github.com/gmddd002/python-xray-argo
+# Repo A: https://github.com/gmddd002/free-vps-py   (入口脚本)
+# Repo B: https://github.com/gmddd002/python-xray-argo (核心逻辑)
 # =========================================
 
 set -e
-LOGFILE="deploy.log"
-echo ">>> 开始部署（无 root 环境兼容版）..." | tee -a "$LOGFILE"
+BASE_DIR=$HOME/app
+REPO_B="$HOME/python-xray-argo"
+LOGFILE="$BASE_DIR/app.log"
 
-# ================================
-# 1. Python 环境 & 依赖
-# ================================
-echo ">>> 安装 Python 依赖..." | tee -a "$LOGFILE"
-pip3 install --user --upgrade pip requests psutil > /dev/null 2>&1 || true
+mkdir -p "$BASE_DIR"
+cd "$BASE_DIR"
 
-# ================================
-# 2. cloudflared (Argo Tunnel)
-# ================================
-echo ">>> 下载 cloudflared..." | tee -a "$LOGFILE"
-mkdir -p ~/.local/bin
-CLOUDFLARED=~/.local/bin/cloudflared
+echo ">>> 开始部署（保守版）..."
+
+# ========== 安装依赖 ==========
+echo ">>> 安装 Python 依赖..."
+pip3 install --user -U pip requests psutil flask
+
+# ========== 安装 cloudflared ==========
+echo ">>> 下载 cloudflared..."
+mkdir -p "$BASE_DIR/bin"
+CLOUDFLARED="$BASE_DIR/bin/cloudflared"
 curl -L -o "$CLOUDFLARED" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
 chmod +x "$CLOUDFLARED"
-export PATH="$HOME/.local/bin:$PATH"
 
-# ================================
-# 3. 拉取用户仓库
-# ================================
-rm -rf ~/python-xray-argo
-git clone https://github.com/gmddd002/python-xray-argo.git ~/python-xray-argo
-cd ~/python-xray-argo
-pip3 install --user -r requirements.txt > /dev/null 2>&1 || true
+# ========== 拉取仓库 B ==========
+echo ">>> 拉取 python-xray-argo..."
+rm -rf "$REPO_B"
+git clone https://github.com/gmddd002/python-xray-argo.git "$REPO_B"
+cd "$REPO_B"
 
-# ================================
-# 4. 分配随机端口
-# ================================
-PORT=$(python3 - <<'PYCODE'
-import socket, random
-while True:
-    port = random.randint(20000, 29999)
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex(('127.0.0.1', port)) != 0:
-            print(port)
-            break
-PYCODE
-)
-export PORT
+echo ">>> 安装 requirements..."
+pip3 install --user -r requirements.txt
 
-# ================================
-# 5. 启动服务
-# ================================
-echo ">>> 启动 Xray-Argo 应用..." | tee -a "$LOGFILE"
-nohup python3 app.py > app.log 2>&1 &
+# ========== 启动服务 ==========
+echo ">>> 启动 Xray-Argo 应用..."
+# 杀掉可能残留的旧进程
+pkill -f "python3 app.py" || true
+
+# 启动主服务
+nohup python3 app.py >"$LOGFILE" 2>&1 &
 MAIN_PID=$!
-# 保活
-nohup bash -c "while true; do ps -p $MAIN_PID >/dev/null || nohup python3 app.py > app.log 2>&1 &; sleep 30; done" >/dev/null 2>&1 &
-KEEP_PID=$!
 
-# ================================
-# 6. 等待节点信息生成
-# ================================
-SUB_FILE="sub.txt"
-for i in {1..30}; do
-    if [ -s "$SUB_FILE" ]; then
-        break
+# 启动保活进程
+(
+  while true; do
+    if ! ps -p $MAIN_PID > /dev/null; then
+      echo ">>> [保活] 发现服务退出，重启中..." | tee -a "$LOGFILE"
+      nohup python3 app.py >>"$LOGFILE" 2>&1 &
+      MAIN_PID=$!
     fi
-    sleep 2
-done
+    sleep 20
+  done
+) &
+KEEPALIVE_PID=$!
 
-SUB_B64=$(cat "$SUB_FILE" 2>/dev/null || echo "")
-DECODED_LINKS=$(echo "$SUB_B64" | base64 -d 2>/dev/null || echo "")
+sleep 10
 
-VLESS_URI=$(echo "$DECODED_LINKS" | grep -m1 '^vless://')
-VMESS_URI=$(echo "$DECODED_LINKS" | grep -m1 '^vmess://')
-TROJAN_URI=$(echo "$DECODED_LINKS" | grep -m1 '^trojan://')
-
-UUID=$(echo "$VLESS_URI" | grep -oP '(?<=://)[^@]+')
-SNI=$(echo "$VLESS_URI" | grep -oP '(?<=sni=)[^&]+')
-HOST=$(echo "$VLESS_URI" | grep -oP '(?<=host=)[^&]+')
-
-# ================================
-# 7. 输出最终信息
-# ================================
+# ========== 展示节点信息 ==========
 echo "========================================"
-echo "                  部署完成！             "
+echo "              部署完成！"
 echo "========================================"
 echo
 echo "=== 服务信息 ==="
 echo "服务状态: 运行中"
 echo "主服务PID: $MAIN_PID"
-echo "保活服务PID: $KEEP_PID"
-echo "服务端口: $PORT"
-echo "UUID: $UUID"
-echo "订阅路径: /sub"
-echo
-echo "=== 访问地址 ==="
-echo "订阅地址: http://$(curl -s ifconfig.me):$PORT/sub"
-echo "管理面板: http://$(curl -s ifconfig.me):$PORT"
-echo "本地订阅: http://localhost:$PORT/sub"
-echo "本地面板: http://localhost:$PORT"
-echo
-echo "=== 节点信息 ==="
-echo "节点配置:"
-[ -n "$VLESS_URI" ] && echo -e "\n$VLESS_URI\n"
-[ -n "$VMESS_URI" ] && echo -e "$VMESS_URI\n"
-[ -n "$TROJAN_URI" ] && echo -e "$TROJAN_URI\n"
-echo
-echo "订阅链接:"
-echo "$SUB_B64"
-echo
-cat > ~/.xray_nodes_info <<EOF
-服务端口: $PORT
-UUID: $UUID
-订阅: http://$(curl -s ifconfig.me):$PORT/sub
+echo "保活服务PID: $KEEPALIVE_PID"
 
-$VLESS_URI
-$VMESS_URI
-$TROJAN_URI
+# 从 sub.txt 读取订阅信息
+SUB_FILE="$REPO_B/sub.txt"
+if [[ -f "$SUB_FILE" ]]; then
+  SUB_B64=$(cat "$SUB_FILE")
+  LINKS=$(echo "$SUB_B64" | base64 -d 2>/dev/null || true)
+
+  echo
+  echo "=== 节点信息 ==="
+  echo "$LINKS"
+  echo
+  echo "订阅链接:"
+  echo "$SUB_B64"
+else
+  echo
+  echo "⚠️ 未找到 $SUB_FILE，节点信息暂不可用"
+fi
+
+# 保存节点信息
+cat > ~/.xray_nodes_info <<EOF
+=======================================
+           节点信息保存
+=======================================
+部署时间: $(date)
+主服务PID: $MAIN_PID
+保活服务PID: $KEEPALIVE_PID
+订阅文件: $SUB_FILE
+日志文件: $LOGFILE
+=======================================
 EOF
 
-echo "节点信息已保存到 ~/.xray_nodes_info"
-echo "=== 重要提示 ==="
-echo "部署已完成，节点信息已成功生成"
-echo "可以立即使用订阅地址导入客户端"
-echo "已集成 YouTube/Netflix/Disney/PrimeVideo 分流规则"
-echo "服务将持续在后台运行"
 echo
+echo "节点信息已保存到 ~/.xray_nodes_info"
 echo "部署完成！感谢使用！"
+
+# ========== 启动 Flask 前端 ==========
+FLASK_APP="$BASE_DIR/web_frontend.py"
+
+cat > "$FLASK_APP" <<'PYCODE'
+import base64
+import os
+from flask import Flask, render_template_string
+
+app = Flask(__name__)
+
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>节点信息面板</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 20px; }
+pre { background: #f4f4f4; padding: 10px; border-radius: 5px; }
+h2 { color: #2c3e50; }
+</style>
+</head>
+<body>
+  <h1>节点信息面板</h1>
+  {% if links %}
+    <h2>VLESS / VMESS / Trojan</h2>
+    <pre>{{ links }}</pre>
+    <h2>订阅链接 (Base64)</h2>
+    <pre>{{ sub_b64 }}</pre>
+  {% else %}
+    <p style="color:red;">未找到订阅信息，请检查 sub.txt</p>
+  {% endif %}
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    sub_file = os.path.expanduser("~/python-xray-argo/sub.txt")
+    if os.path.exists(sub_file):
+        with open(sub_file, "r") as f:
+            sub_b64 = f.read().strip()
+        try:
+            links = base64.b64decode(sub_b64).decode()
+        except Exception:
+            links = "⚠️ Base64 解码失败"
+    else:
+        sub_b64, links = None, None
+    return render_template_string(TEMPLATE, links=links, sub_b64=sub_b64)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+PYCODE
+
+echo ">>> 启动 Flask 前端 (端口: 8080)..."
+nohup python3 "$FLASK_APP" >"$BASE_DIR/web.log" 2>&1 &
+
+echo "前端面板地址: http://<你的服务器IP>:8080"
