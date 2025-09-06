@@ -1,164 +1,96 @@
 #!/bin/bash
 # =========================================
-# 保守版一键部署脚本 + Flask 前端展示
+# 自控版一键部署脚本
 # Author: gmddd002
-# Repo A: https://github.com/gmddd002/free-vps-py   (入口脚本)
-# Repo B: https://github.com/gmddd002/python-xray-argo (核心逻辑)
+# 仓库: https://github.com/gmddd002/free-vps-py
+# 项目: https://github.com/gmddd002/python-xray-argo
 # =========================================
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'  # 无颜色
 
-set -e
-BASE_DIR=$HOME/app
-REPO_B="$HOME/python-xray-argo"
-LOGFILE="$BASE_DIR/app.log"
+LOGFILE="app.log"
 
-mkdir -p "$BASE_DIR"
-cd "$BASE_DIR"
+echo -e "${GREEN}>>> 安装必要依赖...${NC}" | tee -a "$LOGFILE"
+# 更新软件源并安装 Python3、pip、screen、jq 等
+apt-get update
+apt-get install -y python3 python3-pip screen jq curl git
 
-echo ">>> 开始部署（保守版）..."
+echo -e "${GREEN}>>> 安装 cloudflared（Argo 隧道客户端）...${NC}" | tee -a "$LOGFILE"
+# 安装 cloudflared：可通过 apt 或下载官方包
+curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+dpkg -i cloudflared.deb 2>/dev/null || apt-get install -f -y
+rm -f cloudflared.deb
 
-# ========== 安装依赖 ==========
-echo ">>> 安装 Python 依赖..."
-pip3 install --user -U pip requests psutil flask
+echo -e "${GREEN}>>> 克隆用户仓库并安装依赖...${NC}" | tee -a "$LOGFILE"
+# 从用户 GitHub 仓库拉取脚本
+cd /root
+rm -rf python-xray-argo
+git clone https://github.com/gmddd002/python-xray-argo.git
+cd python-xray-argo
+# 安装 Python 依赖
+pip3 install -r requirements.txt
 
-# ========== 安装 cloudflared ==========
-echo ">>> 下载 cloudflared..."
-mkdir -p "$BASE_DIR/bin"
-CLOUDFLARED="$BASE_DIR/bin/cloudflared"
-curl -L -o "$CLOUDFLARED" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-chmod +x "$CLOUDFLARED"
-
-# ========== 拉取仓库 B ==========
-echo ">>> 拉取 python-xray-argo..."
-rm -rf "$REPO_B"
-git clone https://github.com/gmddd002/python-xray-argo.git "$REPO_B"
-cd "$REPO_B"
-
-echo ">>> 安装 requirements..."
-pip3 install --user -r requirements.txt
-
-# ========== 启动服务 ==========
-echo ">>> 启动 Xray-Argo 应用..."
-# 杀掉可能残留的旧进程
-pkill -f "python3 app.py" || true
-
-# 启动主服务
-nohup python3 app.py >"$LOGFILE" 2>&1 &
-MAIN_PID=$!
-
-# 启动保活进程
-(
-  while true; do
-    if ! ps -p $MAIN_PID > /dev/null; then
-      echo ">>> [保活] 发现服务退出，重启中..." | tee -a "$LOGFILE"
-      nohup python3 app.py >>"$LOGFILE" 2>&1 &
-      MAIN_PID=$!
-    fi
-    sleep 20
-  done
-) &
-KEEPALIVE_PID=$!
-
-sleep 10
-
-# ========== 展示节点信息 ==========
-echo "========================================"
-echo "              部署完成！"
-echo "========================================"
-echo
-echo "=== 服务信息 ==="
-echo "服务状态: 运行中"
-echo "主服务PID: $MAIN_PID"
-echo "保活服务PID: $KEEPALIVE_PID"
-
-# 从 sub.txt 读取订阅信息
-SUB_FILE="$REPO_B/sub.txt"
-if [[ -f "$SUB_FILE" ]]; then
-  SUB_B64=$(cat "$SUB_FILE")
-  LINKS=$(echo "$SUB_B64" | base64 -d 2>/dev/null || true)
-
-  echo
-  echo "=== 节点信息 ==="
-  echo "$LINKS"
-  echo
-  echo "订阅链接:"
-  echo "$SUB_B64"
-else
-  echo
-  echo "⚠️ 未找到 $SUB_FILE，节点信息暂不可用"
-fi
-
-# 保存节点信息
-cat > ~/.xray_nodes_info <<EOF
-=======================================
-           节点信息保存
-=======================================
-部署时间: $(date)
-主服务PID: $MAIN_PID
-保活服务PID: $KEEPALIVE_PID
-订阅文件: $SUB_FILE
-日志文件: $LOGFILE
-=======================================
-EOF
-
-echo
-echo "节点信息已保存到 ~/.xray_nodes_info"
-echo "部署完成！感谢使用！"
-
-# ========== 启动 Flask 前端 ==========
-FLASK_APP="$BASE_DIR/web_frontend.py"
-
-cat > "$FLASK_APP" <<'PYCODE'
-import base64
-import os
-from flask import Flask, render_template_string
-
-app = Flask(__name__)
-
-TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>节点信息面板</title>
-<style>
-body { font-family: Arial, sans-serif; margin: 20px; }
-pre { background: #f4f4f4; padding: 10px; border-radius: 5px; }
-h2 { color: #2c3e50; }
-</style>
-</head>
-<body>
-  <h1>节点信息面板</h1>
-  {% if links %}
-    <h2>VLESS / VMESS / Trojan</h2>
-    <pre>{{ links }}</pre>
-    <h2>订阅链接 (Base64)</h2>
-    <pre>{{ sub_b64 }}</pre>
-  {% else %}
-    <p style="color:red;">未找到订阅信息，请检查 sub.txt</p>
-  {% endif %}
-</body>
-</html>
-"""
-
-@app.route("/")
-def index():
-    sub_file = os.path.expanduser("~/python-xray-argo/sub.txt")
-    if os.path.exists(sub_file):
-        with open(sub_file, "r") as f:
-            sub_b64 = f.read().strip()
-        try:
-            links = base64.b64decode(sub_b64).decode()
-        except Exception:
-            links = "⚠️ Base64 解码失败"
-    else:
-        sub_b64, links = None, None
-    return render_template_string(TEMPLATE, links=links, sub_b64=sub_b64)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+# 自动分配未占用端口（优选 20000–29999 范围）
+echo -e "${GREEN}>>> 分配未占用的服务端口...${NC}" | tee -a "$LOGFILE"
+while true; do
+  PORT=$(python3 - <<'PYCODE'
+import socket, random
+while True:
+    port = random.randint(20000, 29999)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(('localhost', port)) != 0:
+            print(port)
+            break
 PYCODE
+)
+  # 验证端口号是否获取成功
+  if [[ -n "$PORT" ]]; then
+    break
+  fi
+done
+export PORT
+echo -e "${BLUE}Allocated PORT:$NC $PORT" | tee -a "$LOGFILE"
 
-echo ">>> 启动 Flask 前端 (端口: 8080)..."
-nohup python3 "$FLASK_APP" >"$BASE_DIR/web.log" 2>&1 &
+# 启动 Xray-Argo 服务并记录日志
+echo -e "${GREEN}>>> 启动 Xray-Argo 应用 (app.py)...${NC}" | tee -a "$LOGFILE"
+# 使用 nohup 后台运行 app.py，并将输出同时记录到控制台和日志
+nohup python3 app.py 2>&1 | tee -a "$LOGFILE" &
 
-echo "前端面板地址: http://<你的服务器IP>:8080"
+# 等待服务启动完成并生成所需文件
+sleep 15
+
+# 从 boot.log 中提取 trycloudflare 域名（Argo Tunnel 分配的临时地址）
+ARGO_ADDR=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' boot.log | head -n1)
+ARGO_ADDR=${ARGO_ADDR#https://}
+echo -e "${GREEN}临时隧道地址:${NC} $ARGO_ADDR" | tee -a "$LOGFILE"
+
+# 读取并解码订阅（Base64 内容），获得各协议链接
+SUB_B64=$(cat sub.txt)
+echo -e "${GREEN}Base64 订阅链接:${NC} $SUB_B64" | tee -a "$LOGFILE"
+DECODED_LINKS=$(echo "$SUB_B64" | base64 -d)
+echo -e "${GREEN}节点连接信息 (VLESS/VMESS/Trojan):${NC}" | tee -a "$LOGFILE"
+# 分别提取三种协议的完整 URI
+VLESS_URI=$(echo "$DECODED_LINKS" | grep -oE 'vless://[^ ]+')
+VMESS_URI=$(echo "$DECODED_LINKS" | grep -oE 'vmess://[^ ]+')
+TROJAN_URI=$(echo "$DECODED_LINKS" | grep -oE 'trojan://[^ ]+')
+echo "  VLESS: $VLESS_URI" | tee -a "$LOGFILE"
+echo "  VMESS: $VMESS_URI" | tee -a "$LOGFILE"
+echo "  Trojan: $TROJAN_URI" | tee -a "$LOGFILE"
+
+# 解析并打印关键连接参数：UUID、端口、SNI、Host、传输类型等
+UUID=$(echo "$VLESS_URI" | grep -oP '(?<=://)[^@]+')
+PORT_NUM=$(echo "$VLESS_URI" | awk -F'[@:]' '{print $3}' | cut -d'?' -f1)
+SNI=$(echo "$VLESS_URI" | grep -oP '(?<=&sni=)[^&]+')
+HOST=$(echo "$VLESS_URI" | grep -oP '(?<=&host=)[^&]+')
+NET_TYPE=$(echo "$VLESS_URI" | grep -oP '(?<=&type=)[^&]+')
+echo -e "${GREEN}连接参数:${NC}" | tee -a "$LOGFILE"
+echo "  UUID: $UUID" | tee -a "$LOGFILE"
+echo "  端口: $PORT_NUM" | tee -a "$LOGFILE"
+echo "  SNI: $SNI" | tee -a "$LOGFILE"
+echo "  Host: $HOST" | tee -a "$LOGFILE"
+echo "  传输类型: $NET_TYPE" | tee -a "$LOGFILE"
+
+echo -e "${GREEN}>>> 部署完成，服务已启动并运行。${NC}" | tee -a "$LOGFILE"
